@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""Add one mail account to aerc: writes its section to accounts.conf and stores the password
+in the GNOME keyring (never in a file, never on a command line).
+
+  aerc-add-account                       ask for everything
+  aerc-add-account --provider gmail --name personal --email you@gmail.com
+
+Providers: gmail, workspace (Google Workspace), aol, outlook (OAuth2), other (any IMAP/SMTP).
+Run it as your normal user, not with sudo (the keyring belongs to your login session).
+
+After adding the account it checks the login, sets up the Gmail Trash key if the account is on
+Gmail, and (re)starts the new-mail notification service.
+
+Options
+  --provider P      gmail | workspace | aol | outlook | other
+  --name NAME       short account name (letters, digits, - and _); shown as the tab name
+  --email ADDRESS   the account's email address (also the login name)
+  --display-name N  your name in the From header
+  --imap HOST[:PORT] --smtp HOST[:PORT] --smtp-security tls|starttls     (provider "other")
+  --client-id ID    Outlook: your app registration's Application (client) ID
+  --password-stdin  read the password from standard input instead of prompting (for scripts)
+  --replace-password  replace the password of an existing account without asking
+  --no-check        do not test the login
+  --no-service      do not touch the notification service
+"""
+import argparse
+import configparser
+import getpass
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.parse
+
+CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "aerc")
+ACCOUNTS = os.environ.get("AERC_ACCOUNTS_CONF") or os.path.join(CONF_DIR, "accounts.conf")
+CLIENT_ID_FILE = os.path.join(CONF_DIR, "outlook-client-id")
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+PROVIDERS = {
+    "gmail":     dict(imap=("imap.gmail.com", 993), smtp=("smtp.gmail.com", 465), smtp_tls="tls",
+                      note="Use a Google app password (Google Account > Security > App passwords), not your normal password."),
+    "workspace": dict(imap=("imap.gmail.com", 993), smtp=("smtp.gmail.com", 465), smtp_tls="tls",
+                      note="Use a Google app password; your Workspace admin must allow IMAP and app passwords."),
+    "aol":       dict(imap=("export.imap.aol.com", 993), smtp=("smtp.aol.com", 465), smtp_tls="tls",
+                      note="Use an AOL app password (Account security > Generate app password)."),
+    "outlook":   dict(imap=("outlook.office365.com", 993), smtp=("smtp.office365.com", 587), smtp_tls="starttls",
+                      note=None),
+    "other":     dict(imap=None, smtp=None, smtp_tls=None, note=None),
+}
+TOKEN_ENDPOINT = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+
+
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+'-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}")
+HOST_RE = re.compile(r"[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?")
+NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
+RESERVED_NAMES = {"outlook-oauth"}  # keyring entry used by aerc-outlook-token
+
+
+def die(msg):
+    sys.exit("error: " + msg)
+
+
+def no_control(value, what):
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        die("%s must not contain control characters or line breaks" % what)
+    return value
+
+
+def valid_email(v):
+    return no_control(v, "the email address") and EMAIL_RE.fullmatch(v) is not None
+
+
+def valid_name(v):
+    return NAME_RE.fullmatch(v) is not None and v not in RESERVED_NAMES
+
+
+def format_from(display_name, address):
+    """'Name <addr>' with the display name quoted when it contains header specials."""
+    name = no_control(display_name or "", "the display name").strip()
+    if not name:
+        return address
+    if re.search(r"[#;]", name):
+        die("the display name must not contain # or ;")
+    if re.search(r'[()<>\[\]:@\\,".]', name):
+        name = '"%s"' % name.replace("\\", "\\\\").replace('"', '\\"')
+    return "%s <%s>" % (name, address)
+
+
+def tool(name):
+    """Find a sibling helper: next to this script (repo checkout) or on PATH (installed)."""
+    local = os.path.join(HERE, name)
+    return local if os.path.exists(local) else (shutil.which(name) or die("%s not found; run install.sh first" % name))
+
+
+def ask(prompt, default=None, validate=None):
+    if not sys.stdin.isatty():
+        if default and (not validate or validate(default)):
+            return default
+        die("missing a required value and no terminal to ask on: %s" % prompt)
+    while True:
+        v = input("%s%s: " % (prompt, " [%s]" % default if default else "")).strip() or (default or "")
+        if v and (not validate or validate(v)):
+            return v
+        print("  invalid, try again")
+
+
+def hostport(value, default_port):
+    host, _, port = value.partition(":")
+    if not HOST_RE.fullmatch(host):
+        die("%r is not a valid host name" % host)
+    if port and not (port.isdigit() and 0 < int(port) < 65536):
+        die("%r is not a valid port" % port)
+    return host, int(port) if port else default_port
+
+
+def read_accounts():
+    cp = configparser.RawConfigParser(strict=False)
+    try:
+        cp.read(ACCOUNTS, encoding="utf-8")
+    except configparser.Error as e:
+        die("cannot parse %s (%s); fix or remove the offending line first" % (ACCOUNTS, str(e).splitlines()[0][:100]))
+    return cp
+
+
+def existing_names():
+    return set(read_accounts().sections())
+
+
+def has_outlook_oauth(cp):
+    return any("xoauth2" in cp[n].get("source", "") and "outlook.office365.com" in cp[n].get("source", "")
+               for n in cp.sections())
+
+
+def store_password(name, password):
+    if not shutil.which("secret-tool"):
+        die("secret-tool is missing; run install.sh first (it installs libsecret-tools)")
+    r = subprocess.run(["secret-tool", "store", "--label=aerc " + name, "service", "aerc", "account", name],
+                       input=password.encode(), capture_output=True)
+    if r.returncode:
+        die("could not store the password in the keyring: %s" % r.stderr.decode().strip()[:200])
+
+
+def read_password(name, from_stdin, note):
+    if from_stdin:
+        pw = sys.stdin.readline().rstrip("\n")
+    else:
+        if not sys.stdin.isatty():
+            die("no terminal for the password prompt (use --password-stdin)")
+        if note:
+            print(note)
+        pw = getpass.getpass("Password for %s (hidden): " % name)
+        if getpass.getpass("Repeat it: ") != pw:
+            die("the two entries differ; nothing was changed")
+    if not pw:
+        die("empty password")
+    return pw
+
+
+def build_section(a, host_imap, host_smtp, smtp_tls, client_id):
+    user = urllib.parse.quote(a.email, safe="")
+    frm = format_from(a.display_name, a.email)
+    lines = ["[%s]" % a.name]
+    if a.provider == "outlook":
+        q = ("token_endpoint=%s&client_id=%s&scope=" % (urllib.parse.quote(TOKEN_ENDPOINT, safe=""), client_id))
+        lines += [
+            "source        = imaps+xoauth2://%s@%s:%d?%s%s" % (user, host_imap[0], host_imap[1], q,
+                urllib.parse.quote("https://outlook.office.com/IMAP.AccessAsUser.All offline_access", safe="")),
+            "outgoing      = smtp+xoauth2://%s@%s:%d?%s%s" % (user, host_smtp[0], host_smtp[1], q,
+                urllib.parse.quote("https://outlook.office.com/SMTP.Send offline_access", safe="")),
+            "source-cred-cmd   = aerc-outlook-token refresh",
+            "outgoing-cred-cmd = aerc-outlook-token refresh",
+        ]
+    else:
+        cred = "secret-tool lookup service aerc account %s" % a.name
+        scheme = "smtps" if smtp_tls == "tls" else "smtp"
+        lines += [
+            "source        = imaps://%s@%s:%d" % (user, host_imap[0], host_imap[1]),
+            "outgoing      = %s://%s@%s:%d" % (scheme, user, host_smtp[0], host_smtp[1]),
+            "source-cred-cmd   = " + cred,
+            "outgoing-cred-cmd = " + cred,
+        ]
+    lines += ["from          = " + frm, "default       = INBOX", "cache-headers = true"]
+    return "\n".join(lines) + "\n"
+
+
+def append_section(text):
+    os.makedirs(CONF_DIR, exist_ok=True)
+    fd = os.open(ACCOUNTS, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a") as f:
+        if f.tell() > 0:
+            f.write("\n")
+        f.write(text)
+    os.chmod(ACCOUNTS, 0o600)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Add a mail account to aerc.", add_help=True)
+    p.add_argument("--provider", choices=sorted(PROVIDERS))
+    p.add_argument("--name")
+    p.add_argument("--email")
+    p.add_argument("--display-name")
+    p.add_argument("--imap")
+    p.add_argument("--smtp")
+    p.add_argument("--smtp-security", choices=("tls", "starttls"))
+    p.add_argument("--client-id")
+    p.add_argument("--password-stdin", action="store_true")
+    p.add_argument("--replace-password", action="store_true",
+                   help="allow replacing the stored password of an existing account without asking")
+    p.add_argument("--no-check", action="store_true")
+    p.add_argument("--no-service", action="store_true")
+    a = p.parse_args()
+    if os.geteuid() == 0:
+        die("do not run this as root or with sudo; the keyring belongs to your own login session")
+
+    a.provider = a.provider or ask("Provider (%s)" % "/".join(sorted(PROVIDERS)), validate=lambda v: v in PROVIDERS)
+    prov = PROVIDERS[a.provider]
+    a.email = a.email or ask("Email address", validate=valid_email)
+    if not valid_email(a.email):
+        die("%r does not look like an email address" % a.email)
+    suggestion = re.sub(r"[^a-z0-9_-]", "", a.provider if a.provider != "other" else a.email.split("@")[1].split(".")[0])
+    a.name = a.name or ask("Short account name (used as the tab name)", default=suggestion,
+                           validate=valid_name)
+    if not valid_name(a.name):
+        die("the account name may only contain letters, digits, - and _ (and %s is reserved)" % ", ".join(sorted(RESERVED_NAMES)))
+    if a.display_name is None and sys.stdin.isatty():
+        a.display_name = input("Your name for the From header (optional): ").strip()
+    format_from(a.display_name, a.email)  # validate now, before anything is stored
+
+    if a.provider == "other":
+        host_imap = hostport(a.imap or ask("IMAP server (host[:port])"), 993)
+        host_smtp = hostport(a.smtp or ask("SMTP server (host[:port])"), 465)
+        smtp_tls = a.smtp_security or ask("SMTP security (tls = port 465, starttls = port 587)", default="tls",
+                                          validate=lambda v: v in ("tls", "starttls"))
+    else:
+        host_imap, host_smtp, smtp_tls = prov["imap"], prov["smtp"], prov["smtp_tls"]
+
+    cp = read_accounts()
+    exists = a.name in cp.sections()
+    if exists and a.provider != "outlook":
+        print("An account named %r already exists in %s; only its stored password would be replaced." % (a.name, ACCOUNTS))
+        if not a.replace_password:
+            if not sys.stdin.isatty() or a.password_stdin:
+                die("refusing to replace the password of %r without --replace-password" % a.name)
+            if input("Replace the stored password? [y/N] ").strip().lower() != "y":
+                die("nothing was changed")
+    elif exists:
+        die("account %r already exists; remove its section from %s first if you want to redo it" % (a.name, ACCOUNTS))
+    if a.provider == "outlook" and has_outlook_oauth(cp):
+        die("an Outlook OAuth account is already configured; only one is supported (they share one token store)")
+
+    client_id = None
+    if a.provider == "outlook":
+        print("Outlook needs OAuth2 with an app registration you control (see the README, section Outlook).")
+        client_id = a.client_id or ask("Application (client) ID of your app registration",
+                                       validate=lambda v: re.fullmatch(r"[0-9a-fA-F-]{36}", v))
+        if not re.fullmatch(r"[0-9a-fA-F-]{36}", client_id):
+            die("that does not look like a client ID (a 36-character GUID)")
+        fd = os.open(CLIENT_ID_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(client_id + "\n")
+        print("Starting the one-time Microsoft login; follow the instructions below.")
+        if subprocess.run([sys.executable, tool("aerc-outlook-token"), "login"]).returncode:
+            die("the Microsoft login failed; nothing was added")
+    else:
+        store_password(a.name, read_password(a.name, a.password_stdin, prov["note"]))
+        print("Password stored in the keyring (service aerc, account %s)." % a.name)
+
+    if not exists:
+        append_section(build_section(a, host_imap, host_smtp, smtp_tls, client_id))
+        print("Added [%s] to %s" % (a.name, ACCOUNTS))
+
+    watch = tool("aerc-mailwatch")
+    if not a.no_check:
+        r = subprocess.run([sys.executable, watch, "--check", a.name])
+        if r.returncode:
+            print("warning: the login test failed; check the address and password, then run this again "
+                  "(an existing account only gets its password replaced).", file=sys.stderr)
+    if a.provider in ("gmail", "workspace") or (a.provider == "other" and host_imap[0] in ("imap.gmail.com", "imap.googlemail.com")):
+        print("Looking up the Gmail Trash folder for the delete key ...")
+        subprocess.run([sys.executable, watch, "--update-trash-binds"])
+    if not a.no_service and shutil.which("systemctl"):
+        unit = subprocess.run(["systemctl", "--user", "cat", "aerc-mailwatch.service"], capture_output=True)
+        if unit.returncode == 0:
+            subprocess.run(["systemctl", "--user", "daemon-reload"])
+            subprocess.run(["systemctl", "--user", "enable", "aerc-mailwatch.service"], capture_output=True)
+            if subprocess.run(["systemctl", "--user", "restart", "aerc-mailwatch.service"]).returncode == 0:
+                print("New-mail notifications restarted to include %s." % a.name)
+        else:
+            print("note: the notification service is not installed; run install.sh to get it.")
+    print("Done. Restart aerc to see the new account.")
+
+
+if __name__ == "__main__":
+    main()

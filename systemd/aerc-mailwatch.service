@@ -1,0 +1,13 @@
+[Unit]
+Description=New-mail desktop notifications (aerc accounts)
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/aerc-mailwatch
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+NoNewPrivileges=yes
+RestartSec=30
+
+[Install]
+WantedBy=default.target

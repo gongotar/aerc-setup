@@ -1,0 +1,7 @@
+# Never commit anything that could hold personal data or secrets.
+accounts.conf
+outlook-client-id
+mailwatch.conf
+*.log
+__pycache__/
+*.pyc

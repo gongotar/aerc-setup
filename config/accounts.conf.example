@@ -1,0 +1,54 @@
+# Reference only. The normal way to add accounts is the `aerc-add-account` command, which
+# writes sections like these to ~/.config/aerc/accounts.conf and stores the password in the
+# keyring for you. Use this file if you prefer to edit accounts.conf by hand.
+# Keep the real file private: chmod 600.
+#
+# No passwords live in this file. Each account's secret is read at run time from the
+# GNOME keyring. Store it once per account with:
+#
+#   secret-tool store --label="aerc <name>" service aerc account <name>
+#
+# <name> must match the account key used below (gmail, work, aol, outlook).
+# In URLs, '@' inside a username must be written as %40.
+
+[gmail]
+source        = imaps://you%40gmail.com@imap.gmail.com:993
+outgoing      = smtps://you%40gmail.com@smtp.gmail.com:465
+source-cred-cmd   = secret-tool lookup service aerc account gmail
+outgoing-cred-cmd = secret-tool lookup service aerc account gmail
+from          = Your Name <you@gmail.com>
+default       = INBOX
+cache-headers = true
+
+# A Google Workspace address uses the same Gmail servers.
+[work]
+source        = imaps://you%40example.com@imap.gmail.com:993
+outgoing      = smtps://you%40example.com@smtp.gmail.com:465
+source-cred-cmd   = secret-tool lookup service aerc account work
+outgoing-cred-cmd = secret-tool lookup service aerc account work
+from          = Your Name <you@example.com>
+default       = INBOX
+cache-headers = true
+
+[aol]
+source        = imaps://you%40aol.com@export.imap.aol.com:993
+outgoing      = smtps://you%40aol.com@smtp.aol.com:465
+source-cred-cmd   = secret-tool lookup service aerc account aol
+outgoing-cred-cmd = secret-tool lookup service aerc account aol
+from          = Your Name <you@aol.com>
+default       = INBOX
+cache-headers = true
+
+# Outlook.com / Microsoft 365 no longer accept passwords for IMAP, so this account uses
+# OAuth2. YOUR-APP-CLIENT-ID is the Application (client) ID of an app registration you
+# control (see README, "Outlook"). aerc renews the access token itself from the refresh
+# token that `aerc-outlook-token refresh` prints; the refresh token lives in the keyring.
+# Delete this whole section if you do not use Outlook.
+[outlook]
+source        = imaps+xoauth2://you%40outlook.com@outlook.office365.com:993?token_endpoint=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fv2.0%2Ftoken&client_id=YOUR-APP-CLIENT-ID&scope=https%3A%2F%2Foutlook.office.com%2FIMAP.AccessAsUser.All%20offline_access
+outgoing      = smtp+xoauth2://you%40outlook.com@smtp.office365.com:587?token_endpoint=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fv2.0%2Ftoken&client_id=YOUR-APP-CLIENT-ID&scope=https%3A%2F%2Foutlook.office.com%2FSMTP.Send%20offline_access
+source-cred-cmd   = aerc-outlook-token refresh
+outgoing-cred-cmd = aerc-outlook-token refresh
+from          = Your Name <you@outlook.com>
+default       = INBOX
+cache-headers = true

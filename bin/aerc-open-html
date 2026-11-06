@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Open the HTML part of a mail (full RFC822 message on stdin) in the default browser.
+
+Email HTML is untrusted, so the page is written with a strict Content-Security-Policy:
+no scripts, no remote images/fonts/styles/frames (no tracking pixels, nothing is fetched when
+you open it), inline cid: images are embedded as data: URIs, and <base> and meta-refresh tags
+are removed. Links stay clickable (a click is your own decision) and are sent without a Referer.
+The file lives in ~/aerc-html (a private directory) and is deleted after a day.
+"""
+import base64
+import email
+import glob
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from email import policy
+
+CSP = ("default-src 'none'; img-src data:; style-src 'unsafe-inline'; "
+       "base-uri 'none'; form-action 'none'")
+HEAD = ('<meta charset="utf-8">'
+        '<meta http-equiv="Content-Security-Policy" content="%s">'
+        '<meta name="referrer" content="no-referrer">' % CSP)
+
+
+def main():
+    msg = email.message_from_binary_file(sys.stdin.buffer, policy=policy.default)
+    body = msg.get_body(preferencelist=("html",))
+    if body is None:
+        plain = msg.get_body(preferencelist=("plain",))
+        text = plain.get_content() if plain else "(no body)"
+        html = "<pre style='white-space:pre-wrap'>%s</pre>" % (
+            text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    else:
+        html = body.get_content()
+        for part in msg.walk():
+            cid = part.get("Content-ID")
+            if cid and part.get_content_maintype() == "image":
+                data = base64.b64encode(part.get_payload(decode=True) or b"").decode()
+                html = html.replace("cid:" + cid.strip("<>"),
+                                    "data:%s;base64,%s" % (part.get_content_type(), data))
+        html = re.sub(r"<\s*base\b[^>]*>", "", html, flags=re.I)
+        html = re.sub(r"<\s*meta\b[^>]*http-equiv\s*=\s*[\"']?\s*refresh[^>]*>", "", html, flags=re.I)
+
+    # Snap-packaged browsers cannot read /tmp or dot-directories, so use a visible directory in
+    # $HOME, but keep it private to this user.
+    d = os.path.join(os.path.expanduser("~"), "aerc-html")
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+    for old in glob.glob(os.path.join(d, "aerc-*.html")):
+        try:
+            if time.time() - os.path.getmtime(old) > 86400:
+                os.remove(old)
+        except OSError:
+            pass
+    f = tempfile.NamedTemporaryFile("w", suffix=".html", prefix="aerc-", dir=d, delete=False, encoding="utf-8")
+    f.write(HEAD + html)  # our policy comes first, before any untrusted markup
+    f.close()
+    subprocess.Popen(["xdg-open", f.name], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+if __name__ == "__main__":
+    main()

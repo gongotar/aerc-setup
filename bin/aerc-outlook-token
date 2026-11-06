@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""OAuth2 helper for Outlook.com / Microsoft 365 IMAP+SMTP in aerc.
+
+  aerc-outlook-token login     one-time device-code login (approve in a browser)
+  aerc-outlook-token refresh   print the refresh token (for aerc's built-in token renewal;
+                               also rotates the stored copy so its 90-day expiry keeps sliding)
+  aerc-outlook-token           print a fresh access token
+
+Needs the Application (client) ID of an app registration you control, in
+$XDG_CONFIG_HOME/aerc/outlook-client-id (default ~/.config/aerc/outlook-client-id) (see the README). The refresh token lives in the GNOME
+keyring (service aerc, account outlook-oauth); nothing secret is written to disk.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+_idfile = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "aerc", "outlook-client-id")
+try:
+    CLIENT_ID = open(_idfile).read().strip()
+except OSError:
+    sys.exit("missing %s (put your app registration's Application (client) ID in it; see the README)" % _idfile)
+if not CLIENT_ID or CLIENT_ID.startswith("YOUR"):
+    sys.exit("%s does not contain a client ID yet" % _idfile)
+SCOPE = ("https://outlook.office.com/IMAP.AccessAsUser.All "
+         "https://outlook.office.com/SMTP.Send offline_access")
+BASE = "https://login.microsoftonline.com/common/oauth2/v2.0/"
+KEY = ["service", "aerc", "account", "outlook-oauth"]
+
+
+def post(path, data):
+    req = urllib.request.Request(BASE + path, urllib.parse.urlencode(data).encode())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        return json.load(e)
+
+
+def store(refresh):
+    subprocess.run(["secret-tool", "store", "--label=aerc Outlook OAuth refresh token"] + KEY,
+                   input=refresh.encode(), check=True)
+
+
+def login():
+    d = post("devicecode", {"client_id": CLIENT_ID, "scope": SCOPE})
+    if "device_code" not in d:
+        sys.exit("devicecode request failed: %s" % d.get("error_description", d))
+    print("Open %s and enter code: %s" % (d["verification_uri"], d["user_code"]), flush=True)
+    deadline = time.time() + d["expires_in"]
+    while time.time() < deadline:
+        time.sleep(d.get("interval", 5))
+        t = post("token", {"client_id": CLIENT_ID, "device_code": d["device_code"],
+                           "grant_type": "urn:ietf:params:oauth:grant-type:device_code"})
+        if "refresh_token" in t:
+            store(t["refresh_token"])
+            print("OK: refresh token stored in keyring", flush=True)
+            return
+        if t.get("error") != "authorization_pending":
+            sys.exit("login failed: %s" % t.get("error_description", t))
+    sys.exit("login timed out")
+
+
+def token():
+    r = subprocess.run(["secret-tool", "lookup"] + KEY, capture_output=True, text=True)
+    refresh = r.stdout.strip()
+    if not refresh:
+        sys.exit("no refresh token in keyring; run: aerc-outlook-token login")
+    t = post("token", {"client_id": CLIENT_ID, "grant_type": "refresh_token",
+                       "refresh_token": refresh, "scope": SCOPE})
+    if "access_token" not in t:
+        sys.exit("token refresh failed: %s" % t.get("error_description", t))
+    if t.get("refresh_token") and t["refresh_token"] != refresh:
+        store(t["refresh_token"])
+    print(t["access_token"])
+
+
+def refresh_token():
+    """Print the refresh token for aerc's built-in token renewal (see accounts.conf).
+
+    aerc reads credentials only once, at startup, and then renews access tokens
+    itself from this refresh token. We rotate it here on every start so the
+    90-day sliding expiry in the keyring keeps getting extended.
+    """
+    r = subprocess.run(["secret-tool", "lookup"] + KEY, capture_output=True, text=True)
+    refresh = r.stdout.strip()
+    if not refresh:
+        sys.exit("no refresh token in keyring; run: aerc-outlook-token login")
+    try:
+        t = post("token", {"client_id": CLIENT_ID, "grant_type": "refresh_token",
+                           "refresh_token": refresh, "scope": SCOPE})
+        if t.get("refresh_token") and t["refresh_token"] != refresh:
+            store(t["refresh_token"])
+            refresh = t["refresh_token"]
+    except Exception:
+        pass  # offline at startup: still hand aerc the stored token so the account loads
+    print(refresh)
+
+
+if __name__ == "__main__":
+    {"login": login, "refresh": refresh_token}.get((sys.argv[1:] or [""])[0], token)()

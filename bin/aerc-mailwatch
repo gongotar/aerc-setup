@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""New-mail desktop notifications for aerc accounts, independent of aerc itself.
+
+Reads the IMAP accounts from ~/.config/aerc/accounts.conf, polls each INBOX with a cheap
+IMAP STATUS, and shows a notification for unread messages that arrived since the last
+check. Credentials are fetched at run time through each account's source-cred-cmd, exactly
+as aerc does; nothing secret is stored here.
+
+  aerc-mailwatch                    run forever (what the systemd user service does)
+  aerc-mailwatch --list             show which accounts would be watched (no secrets)
+  aerc-mailwatch --selftest NAME    show one notification for NAME's newest unread message
+  aerc-mailwatch --check NAME       try to log in to NAME and report the result (no popup)
+  aerc-mailwatch --update-trash-binds
+                                    (re)generate the aerc key bindings that move mail to Trash
+                                    for every Gmail account (used by aerc-add-account)
+
+Optional ~/.config/aerc/mailwatch.conf:
+  [mailwatch]
+  interval = 60
+  exclude  = aol, other
+"""
+import configparser
+import base64
+import email
+import email.utils
+import imaplib
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from email.header import decode_header, make_header
+
+CONF_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "aerc")
+ACCOUNTS_CONF = os.environ.get("AERC_ACCOUNTS_CONF") or os.path.join(CONF_DIR, "accounts.conf")
+OPTIONS_CONF = os.path.join(CONF_DIR, "mailwatch.conf")
+BINDS_CONF = os.path.join(CONF_DIR, "binds.conf")
+GMAIL_HOSTS = ("imap.gmail.com", "imap.googlemail.com")
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+# --------------------------------------------------------------------------- accounts
+
+class Account:
+    def __init__(self, name, section):
+        self.name = name
+        src = section.get("source", "")
+        u = urllib.parse.urlsplit(src)
+        base, _, self.auth = u.scheme.partition("+")
+        if base not in ("imaps", "imap") or not u.hostname:
+            raise ValueError("not an IMAP source")
+        self.tls = base == "imaps"
+        self.host = u.hostname
+        self.port = u.port or (993 if self.tls else 143)
+        self.user = urllib.parse.unquote(u.username or "")
+        self.url_password = urllib.parse.unquote(u.password) if u.password else None
+        q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+        self.token_endpoint = q.get("token_endpoint")
+        self.client_id = q.get("client_id")
+        self.client_secret = q.get("client_secret")
+        self.scope = q.get("scope")
+        self.cred_cmd = section.get("source-cred-cmd")
+
+    @property
+    def is_gmail(self):
+        return self.host in GMAIL_HOSTS
+
+    def secret(self):
+        if self.url_password is not None:
+            return self.url_password
+        if not self.cred_cmd:
+            raise RuntimeError("no password and no source-cred-cmd")
+        r = subprocess.run(self.cred_cmd, shell=True, capture_output=True, text=True, timeout=60)
+        if r.returncode or not r.stdout.strip():
+            raise RuntimeError("source-cred-cmd failed (rc=%d): %s" % (r.returncode, r.stderr.strip()[:120]))
+        return r.stdout.strip()
+
+    def access_token(self):
+        """The OAuth access token: either the cred-cmd output itself, or, when a
+        token_endpoint is configured, obtained from the refresh token it prints."""
+        value = self.secret()
+        if not self.token_endpoint:
+            return value
+        form = {"grant_type": "refresh_token", "refresh_token": value}
+        if self.client_id:
+            form["client_id"] = self.client_id
+        if self.client_secret:
+            form["client_secret"] = self.client_secret
+        if self.scope:
+            form["scope"] = self.scope
+        try:
+            with urllib.request.urlopen(urllib.request.Request(
+                    self.token_endpoint, urllib.parse.urlencode(form).encode()), timeout=30) as r:
+                data = json.load(r)
+        except urllib.error.HTTPError as e:
+            data = json.load(e)
+        if "access_token" not in data:
+            raise RuntimeError("token refresh failed: %s" % str(data.get("error_description", data))[:120])
+        return data["access_token"]
+
+    def connect(self):
+        if self.tls:
+            m = imaplib.IMAP4_SSL(self.host, self.port, timeout=60)
+        else:
+            m = imaplib.IMAP4(self.host, self.port, timeout=60)
+            m.starttls()
+        if self.auth == "xoauth2":
+            tok = self.access_token()
+            m.authenticate("XOAUTH2", lambda _: ("user=%s\1auth=Bearer %s\1\1" % (self.user, tok)).encode())
+        elif self.auth == "oauthbearer":
+            tok = self.access_token()
+            m.authenticate("OAUTHBEARER", lambda _: ("n,a=%s,\1host=%s\1port=%d\1auth=Bearer %s\1\1" % (
+                self.user, self.host, self.port, tok)).encode())
+        else:
+            m.login(self.user, self.secret())
+        return m
+
+
+def load_accounts(only=None):
+    cp = configparser.RawConfigParser(strict=False)  # Raw: no '%' interpolation in URLs
+    try:
+        if not cp.read(ACCOUNTS_CONF, encoding="utf-8"):
+            sys.exit("cannot read %s" % ACCOUNTS_CONF)
+    except configparser.Error as e:
+        sys.exit("cannot parse %s: %s" % (ACCOUNTS_CONF, str(e).splitlines()[0][:120]))
+    opts = read_options()
+    exclude = {x.strip() for x in opts.get("mailwatch", "exclude", fallback="").split(",") if x.strip()}
+    out = []
+    for name in cp.sections():
+        if name in exclude or (only and name != only):
+            continue
+        try:
+            out.append(Account(name, cp[name]))
+        except ValueError:
+            pass  # not an IMAP account (maildir, notmuch, ...)
+    return out
+
+
+def read_options():
+    opts = configparser.RawConfigParser(inline_comment_prefixes=("#", ";"))
+    try:
+        opts.read(OPTIONS_CONF, encoding="utf-8")
+    except configparser.Error as e:
+        log("ignoring unreadable %s: %s" % (OPTIONS_CONF, str(e).splitlines()[0][:100]))
+        return configparser.RawConfigParser()
+    return opts
+
+
+def interval():
+    try:
+        return max(15, read_options().getint("mailwatch", "interval", fallback=60))
+    except ValueError:
+        log("invalid interval in %s; using 60 seconds" % OPTIONS_CONF)
+        return 60
+
+
+# ------------------------------------------------------------------------ IMAP helpers
+
+def inbox_status(m):
+    _, d = m.status("INBOX", "(UIDNEXT UIDVALIDITY)")
+    s = d[0].decode()
+    return (int(re.search(r"UIDNEXT (\d+)", s).group(1)),
+            int(re.search(r"UIDVALIDITY (\d+)", s).group(1)))
+
+
+def decode_header_value(v):
+    try:
+        return str(make_header(decode_header(v or "")))
+    except Exception:
+        return v or ""
+
+
+def unread_since(m, first_uid):
+    m.select("INBOX", readonly=True)
+    _, d = m.uid("FETCH", "%d:*" % first_uid, "(FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT)])")
+    out = []
+    for i, item in enumerate(d):
+        if not isinstance(item, tuple):
+            continue
+        # Servers may send UID/FLAGS before or after the header literal (Exchange sends them
+        # after), so look at the text on both sides of it.
+        meta = item[0].decode(errors="replace")
+        if i + 1 < len(d) and isinstance(d[i + 1], bytes):
+            meta += " " + d[i + 1].decode(errors="replace")
+        mo = re.search(r"UID (\d+)", meta)
+        if not mo:
+            continue
+        uid = int(mo.group(1))
+        if uid < first_uid or "\\Seen" in meta:
+            continue  # "n:*" always includes the last message, so filter on uid
+        h = email.message_from_bytes(item[1])
+        frm = decode_header_value(h["From"])
+        real, addr = email.utils.parseaddr(frm)
+        out.append((real or addr or frm, decode_header_value(h["Subject"]) or "(no subject)"))
+    try:
+        m.close()  # leave the "selected" state: later STATUS INBOX calls must not target a selected mailbox
+    except Exception:
+        pass
+    return out
+
+
+def esc(t):
+    return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def notify(account, sender, subject):
+    # No -a/-i on purpose: GNOME hides banners for notifications labelled with an app name
+    # that matches a terminal application (such as aerc), but shows anonymous ones.
+    r = subprocess.run(["notify-send", "--", "[%s] %s" % (account, sender[:80]), esc(subject[:160])],
+                       capture_output=True, text=True)
+    if r.returncode:
+        log("%s: notify-send rc=%d %s" % (account, r.returncode, r.stderr.strip()[:150]))
+
+
+# ------------------------------------------------------------------------------ watch
+
+def watch(acct, every):
+    m = uidnext = validity = None
+    last_err = None
+    failures = 0
+    while True:
+        try:
+            if m is None:
+                m = acct.connect()
+            nxt, val = inbox_status(m)
+            if uidnext is None or val != validity:
+                uidnext, validity = nxt, val  # first run or mailbox reset: just record the position
+                log("%s: watching" % acct.name)
+            elif nxt > uidnext:
+                msgs = unread_since(m, uidnext)
+                for sender, subject in msgs[:5]:
+                    notify(acct.name, sender, subject)
+                if len(msgs) > 5:
+                    notify(acct.name, "%d more new messages" % (len(msgs) - 5), "")
+                log("%s: %d new" % (acct.name, len(msgs)))
+                uidnext = nxt
+            last_err = None
+            failures = 0
+        except Exception as e:
+            failures += 1
+            msg = "%s: %s (reconnecting)" % (type(e).__name__, str(e)[:100])
+            if msg != last_err:  # do not repeat the same error every cycle
+                log("%s: %s" % (acct.name, msg))
+                last_err = msg
+            try:
+                m.logout()
+            except Exception:
+                pass
+            m = None
+        # Back off while an account keeps failing (wrong password, locked keyring, outage), so we
+        # do not hammer the server or pop up keyring prompts every minute: 1x, 2x, 4x ... max 30 min.
+        time.sleep(min(every * (2 ** min(failures, 10)) if failures else every, 1800))
+
+
+# ---------------------------------------------------------------- Gmail trash bindings
+
+def imap_utf7_decode(s):
+    def dec(m):
+        if m.group(1) == "":
+            return "&"
+        b = m.group(1).replace(",", "/")
+        b += "=" * (-len(b) % 4)
+        return base64.b64decode(b).decode("utf-16-be")
+    return re.sub(r"&([^-]*)-", dec, s)
+
+
+def trash_folder(acct):
+    m = acct.connect()
+    try:
+        _, lines = m.list()
+    finally:
+        try:
+            m.logout()
+        except Exception:
+            pass
+    for raw in lines:
+        if isinstance(raw, tuple):  # LIST reply that carries the name as a literal
+            raw = raw[0] + b' "' + raw[1] + b'"'
+        s = raw.decode(errors="replace") if isinstance(raw, bytes) else raw
+        mo = re.match(r'\((?P<attrs>[^)]*)\) (?:"[^"]*"|NIL) (?P<name>.+)$', s)
+        if mo and "\\Trash" in mo.group("attrs"):
+            return imap_utf7_decode(mo.group("name").strip().strip('"'))
+    return None
+
+
+TRASH_BEGIN = "# >>> aerc-setup: Gmail Trash bindings"   # matched by prefix; the rest of the line is free text
+TRASH_END = "# <<< aerc-setup: Gmail Trash bindings"
+_SECTION = re.compile(r"^\[(?:messages|view):account=([^\]]+)\]\s*$")
+
+
+def trash_sections(acct):
+    folder = trash_folder(acct)
+    if not folder or not re.fullmatch(r"[\w\[\]/.-]+", folder):
+        raise RuntimeError("Trash folder %r cannot be used safely in a key binding" % folder)
+    return {
+        "[messages:account=%s]" % acct.name: [
+            "[messages:account=%s]" % acct.name,
+            "d = :choose -o y 'Move to Trash?' move %s<Enter>" % folder,
+            "D = :move %s<Enter>" % folder],
+        "[view:account=%s]" % acct.name: [
+            "[view:account=%s]" % acct.name,
+            "D = :move %s<Enter>" % folder],
+    }
+
+
+def update_trash_binds():
+    """Rewrite the generated region of binds.conf: Gmail accounts get d/D bound to 'move to
+    Trash' (Gmail ignores a plain IMAP delete in most folders; the mail just turns gray).
+    Accounts whose lookup fails keep their previous bindings; removed accounts lose them."""
+    try:
+        text = open(BINDS_CONF, encoding="utf-8").read()
+    except OSError as e:
+        sys.exit("cannot read %s: %s" % (BINDS_CONF, e))
+    i, j = text.find(TRASH_BEGIN), text.find(TRASH_END)
+    if i < 0 or j < i:
+        sys.exit("%s has no aerc-setup Trash markers; re-run install.sh to restore them" % BINDS_CONF)
+    first_nl = text.index("\n", i) + 1  # keep the whole marker line, whatever its comment text
+    old, cur = {}, None
+    for line in text[first_nl:j].splitlines():
+        if _SECTION.match(line):
+            cur = line.strip(); old[cur] = [cur]
+        elif cur and line.strip():
+            old[cur].append(line)
+    accounts = load_accounts()
+    existing = {a.name for a in accounts}
+    merged = {h: v for h, v in old.items() if _SECTION.match(h).group(1) in existing}
+    for acct in accounts:
+        if not acct.is_gmail:
+            continue
+        try:
+            merged.update(trash_sections(acct))
+            log("%s: delete key now moves mail to Trash" % acct.name)
+        except Exception as e:
+            log("%s: Trash lookup failed (%s: %s); %s" % (acct.name, type(e).__name__, str(e)[:100],
+                "keeping the previous bindings" if any(_SECTION.match(h).group(1) == acct.name for h in merged)
+                else "aerc's default delete stays"))
+    region = "".join("\n".join(v) + "\n\n" for v in merged.values())
+    new = text[:first_nl] + region + text[j:]
+    target = os.path.realpath(BINDS_CONF)  # keep a symlinked binds.conf (dotfile managers) a symlink
+    tmp = target + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(new)
+    os.replace(tmp, target)
+
+
+# ---------------------------------------------------------------------------- main
+
+def main():
+    args = sys.argv[1:]
+    if args[:1] == ["--list"]:
+        for a in load_accounts():
+            print("%-12s %s:%d  auth=%s%s" % (a.name, a.host, a.port, a.auth or "password",
+                                              "  oauth-refresh" if a.token_endpoint else ""))
+        return
+    if args[:1] == ["--update-trash-binds"]:
+        return update_trash_binds()
+    if args[:1] == ["--check"] and len(args) == 2:
+        accts = load_accounts(only=args[1])
+        if not accts:
+            sys.exit("no such IMAP account: %s" % args[1])
+        try:
+            m = accts[0].connect()
+            m.logout()
+        except Exception as e:
+            sys.exit("login failed: %s: %s" % (type(e).__name__, str(e)[:150]))
+        print("%s: login OK" % args[1])
+        return
+    if args[:1] == ["--selftest"] and len(args) == 2:
+        accts = load_accounts(only=args[1])
+        if not accts:
+            sys.exit("no such IMAP account: %s" % args[1])
+        m = accts[0].connect()
+        nxt, _ = inbox_status(m)
+        msgs = unread_since(m, max(nxt - 1, 1))  # newest message only
+        m.logout()
+        for sender, subject in msgs or [("(self-test)", "your newest message is already read")]:
+            notify(accts[0].name, sender, subject)
+        log("%s: self-test notification sent" % accts[0].name)
+        return
+    if args:
+        sys.exit(__doc__)
+    accounts = load_accounts()
+    if not accounts:
+        log("no IMAP accounts in %s; nothing to watch (run aerc-add-account)" % ACCOUNTS_CONF)
+        return  # exit 0: systemd does not restart it, aerc-add-account starts it later
+    every = interval()
+    for a in accounts:
+        threading.Thread(target=watch, args=(a, every), daemon=True).start()
+    while True:
+        time.sleep(3600)
+
+
+if __name__ == "__main__":
+    main()
