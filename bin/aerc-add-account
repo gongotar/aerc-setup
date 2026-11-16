@@ -45,7 +45,7 @@ PROVIDERS = {
                       note="Use a Google app password; your Workspace admin must allow IMAP and app passwords."),
     "aol":       dict(imap=("export.imap.aol.com", 993), smtp=("smtp.aol.com", 465), smtp_tls="tls",
                       note="Use an AOL app password (Account security > Generate app password)."),
-    "outlook":   dict(imap=("outlook.office365.com", 993), smtp=("smtp.office365.com", 587), smtp_tls="starttls",
+    "outlook":   dict(imap=("outlook.office365.com", 993), smtp=("smtp-mail.outlook.com", 587), smtp_tls="starttls",
                       note=None),
     "other":     dict(imap=None, smtp=None, smtp_tls=None, note=None),
 }

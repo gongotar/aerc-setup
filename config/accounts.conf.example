@@ -46,7 +46,7 @@ cache-headers = true
 # Delete this whole section if you do not use Outlook.
 [outlook]
 source        = imaps+xoauth2://you%40outlook.com@outlook.office365.com:993?token_endpoint=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fv2.0%2Ftoken&client_id=YOUR-APP-CLIENT-ID&scope=https%3A%2F%2Foutlook.office.com%2FIMAP.AccessAsUser.All%20offline_access
-outgoing      = smtp+xoauth2://you%40outlook.com@smtp.office365.com:587?token_endpoint=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fv2.0%2Ftoken&client_id=YOUR-APP-CLIENT-ID&scope=https%3A%2F%2Foutlook.office.com%2FSMTP.Send%20offline_access
+outgoing      = smtp+xoauth2://you%40outlook.com@smtp-mail.outlook.com:587?token_endpoint=https%3A%2F%2Flogin.microsoftonline.com%2Fcommon%2Foauth2%2Fv2.0%2Ftoken&client_id=YOUR-APP-CLIENT-ID&scope=https%3A%2F%2Foutlook.office.com%2FSMTP.Send%20offline_access
 source-cred-cmd   = aerc-outlook-token refresh
 outgoing-cred-cmd = aerc-outlook-token refresh
 from          = Your Name <you@outlook.com>
